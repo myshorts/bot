@@ -29,7 +29,7 @@ jobs:
           TELEGRAM_CHAT_ID: "8472729796"
           RUN_ONCE: "1"
         run: |
-          python bot.py
+          python nowcast_telegram.py
 
       - name: Save bot state if updated
         run: |
