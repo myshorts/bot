@@ -1,43 +1,539 @@
-name: On-Demand Weather Bot
+#!/usr/bin/env python3
+"""
+nowcast_telegram.py
+Bot Telegram thời tiết & cảnh báo điều kiện thời tiết phức tạp theo yêu cầu:
+- Điều khiển bật/tắt bằng /start và /end (hoặc /stop)
+- Hỏi bất kỳ địa điểm nào (hỗ trợ "dự báo <địa điểm>", "thời tiết <địa điểm>", hoặc tên địa điểm trực tiếp)
+- Phân tích lưu ý điều kiện thời tiết phức tạp + dự báo những ngày tới
+- Hỗ trợ chạy 1 lượt khi bấm Run workflow (RUN_ONCE=1) hoặc vòng lặp liên tục
+"""
 
-on:
-  workflow_dispatch:
+import datetime as dt
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-permissions:
-  contents: write
+import requests
 
-jobs:
-  ask-weather:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+STATE_FILE = Path(os.environ.get("STATE_FILE", "bot_user_state.json"))
+OFFSET_FILE = Path(os.environ.get("OFFSET_FILE", ".tg_offset.json"))
+USER_AGENT = "Nowcast-Telegram-Bot/3.0"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+MAIN_KEYBOARD = {
+    "keyboard": [
+        ["📍 Phù Cát (VVPC)", "🏙️ Hà Nội", "🌊 Đà Nẵng"],
+        ["🌴 TP. Hồ Chí Minh", "⛰️ Đà Lạt", "📅 Dự báo nhiều ngày"],
+        ["⚠️ Lưu ý phức tạp", "▶️ Bắt đầu", "⏸️ Nghỉ ngơi"],
+    ],
+    "resize_keyboard": True,
+}
 
-      - name: Run bot once
-        env:
-          TELEGRAM_BOT_TOKEN: "8686902963:AAHjuJbk-IvQUdxQnFeXwkuRcNmEBuWzgDI"
-          TELEGRAM_CHAT_ID: "8472729796"
-          RUN_ONCE: "1"
-        run: |
-          python bot.py
+WEEKDAYS_VI = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ nhật"]
 
-      - name: Save bot state if updated
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if ! git diff --staged --quiet; then
-            git commit -m "chore: update bot state [skip ci]"
-            git pull --rebase origin main
-            git push origin HEAD:main
-          fi
+
+def vn_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone(dt.timedelta(hours=7)))
+
+
+def load_json_dict(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_json_dict(path: Path, data: Dict[str, Any]) -> None:
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"[WARN] Không lưu được {path}: {exc}", file=sys.stderr)
+
+
+def load_offset() -> Optional[int]:
+    data = load_json_dict(OFFSET_FILE)
+    val = data.get("offset")
+    return int(val) if isinstance(val, int) else None
+
+
+def save_offset(offset: Optional[int]) -> None:
+    if offset is not None:
+        save_json_dict(OFFSET_FILE, {"offset": offset, "updated_at": vn_now().isoformat()})
+
+
+def get_token() -> str:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("Thiếu biến môi trường TELEGRAM_BOT_TOKEN.")
+    return token
+
+
+def tg_send(chat_id: str, text: str, with_keyboard: bool = True) -> None:
+    token = get_token()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    if with_keyboard:
+        payload["reply_markup"] = MAIN_KEYBOARD
+
+    resp = requests.post(url, json=payload, timeout=15)
+    if resp.status_code == 400:
+        payload.pop("parse_mode", None)
+        resp = requests.post(url, json=payload, timeout=15)
+    resp.raise_for_status()
+
+
+def normalize_place_query(query: str) -> str:
+    cleaned = query.strip()
+    for prefix in ("📍 ", "🏙️ ", "🌊 ", "🌴 ", "⛰️ "):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :].strip()
+    cleaned = re.sub(
+        r"^(dự báo thời tiết|dự báo|thời tiết|xem thời tiết|hỏi thời tiết)\s+(tại|ở|cho|khu vực)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    return cleaned
+
+
+def geocode_place(query: str) -> Optional[Dict[str, Any]]:
+    cleaned = normalize_place_query(query)
+    if not cleaned:
+        return None
+
+    if cleaned.lower().startswith("phù cát") or cleaned.lower() == "vvpc":
+        return {
+            "name": "Phù Cát (VVPC)",
+            "admin1": "Bình Định",
+            "country": "Việt Nam",
+            "latitude": 13.9550,
+            "longitude": 109.0422,
+        }
+
+    resp = requests.get(
+        GEOCODE_URL,
+        params={"name": cleaned, "count": 1, "language": "vi", "format": "json"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("results") or []
+    if not results:
+        return None
+    top = results[0]
+    return {
+        "name": top.get("name") or cleaned,
+        "admin1": top.get("admin1") or "",
+        "country": top.get("country") or "",
+        "latitude": float(top["latitude"]),
+        "longitude": float(top["longitude"]),
+    }
+
+
+def format_place_label(place: Dict[str, Any]) -> str:
+    parts = [place.get("name", "")]
+    if place.get("admin1"):
+        parts.append(place["admin1"])
+    if place.get("country"):
+        parts.append(place["country"])
+    return ", ".join(p for p in parts if p)
+
+
+def deg_to_dir_vi(deg: Optional[float]) -> str:
+    if deg is None:
+        return "—"
+    dirs = [
+        "Bắc", "Bắc Đông Bắc", "Đông Bắc", "Đông Đông Bắc",
+        "Đông", "Đông Đông Nam", "Đông Nam", "Nam Đông Nam",
+        "Nam", "Nam Tây Nam", "Tây Nam", "Tây Tây Nam",
+        "Tây", "Tây Tây Bắc", "Tây Bắc", "Bắc Tây Bắc",
+    ]
+    return dirs[int((float(deg) + 11.25) // 22.5) % 16]
+
+
+def weather_code_desc(code: Optional[int]) -> str:
+    mapping = {
+        0: "Trời quang nắng ráo",
+        1: "Ít mây, có nắng",
+        2: "Mây rải rác, nắng gián đoạn",
+        3: "Nhiều mây / âm u",
+        45: "Sương mù",
+        48: "Sương mù đóng băng",
+        51: "Mưa phùn nhẹ",
+        53: "Mưa phùn vừa",
+        55: "Mưa phùn dày",
+        61: "Mưa nhỏ",
+        63: "Mưa vừa",
+        65: "Mưa to",
+        80: "Mưa rào nhẹ",
+        81: "Mưa rào vừa",
+        82: "Mưa rào rất to",
+        95: "Dông (có thể kèm mưa rào)",
+        96: "Dông kèm mưa đá nhẹ",
+        99: "Dông kèm mưa đá mạnh",
+    }
+    return mapping.get(int(code) if code is not None else -1, f"Mã {code}")
+
+
+def fetch_weather_snapshot(lat: float, lon: float, now_dt: dt.datetime, forecast_days: int = 5) -> Dict[str, Any]:
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": (
+            "temperature_2m,apparent_temperature,relative_humidity_2m,"
+            "precipitation,rain,showers,weather_code,cloud_cover,"
+            "wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+        ),
+        "hourly": "precipitation_probability,cape,uv_index,visibility",
+        "daily": (
+            "weather_code,temperature_2m_max,temperature_2m_min,"
+            "precipitation_sum,precipitation_probability_max,wind_gusts_10m_max"
+        ),
+        "forecast_days": forecast_days,
+        "timezone": "Asia/Ho_Chi_Minh",
+    }
+    resp = requests.get(FORECAST_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    curr = data.get("current", {})
+    hourly = data.get("hourly", {})
+    daily = data.get("daily", {})
+
+    idx = now_dt.hour
+    probs = hourly.get("precipitation_probability") or []
+    capes = hourly.get("cape") or []
+    uvs = hourly.get("uv_index") or []
+    vis_list = hourly.get("visibility") or []
+
+    vis_km = None
+    if idx < len(vis_list) and vis_list[idx] is not None:
+        vis_km = round(float(vis_list[idx]) / 1000.0, 1)
+
+    days_parsed: List[Dict[str, Any]] = []
+    dates = daily.get("time") or []
+    d_codes = daily.get("weather_code") or []
+    d_tmax = daily.get("temperature_2m_max") or []
+    d_tmin = daily.get("temperature_2m_min") or []
+    d_rain = daily.get("precipitation_sum") or []
+    d_prob = daily.get("precipitation_probability_max") or []
+    d_gust = daily.get("wind_gusts_10m_max") or []
+
+    for i in range(len(dates)):
+        days_parsed.append({
+            "date": dates[i],
+            "code": d_codes[i] if i < len(d_codes) else None,
+            "tmax": d_tmax[i] if i < len(d_tmax) else None,
+            "tmin": d_tmin[i] if i < len(d_tmin) else None,
+            "rain_mm": d_rain[i] if i < len(d_rain) else 0.0,
+            "rain_prob": d_prob[i] if i < len(d_prob) else None,
+            "gust_kmh": d_gust[i] if i < len(d_gust) else None,
+        })
+
+    return {
+        "temp_c": curr.get("temperature_2m"),
+        "feels_like_c": curr.get("apparent_temperature"),
+        "humidity_pct": curr.get("relative_humidity_2m"),
+        "precip_mm": float(curr.get("precipitation") or 0.0),
+        "precip_prob_pct": probs[idx] if idx < len(probs) else None,
+        "weather_code": curr.get("weather_code"),
+        "cloud_cover_pct": curr.get("cloud_cover"),
+        "wind_speed_kmh": curr.get("wind_speed_10m"),
+        "wind_gust_kmh": curr.get("wind_gusts_10m"),
+        "wind_dir_deg": curr.get("wind_direction_10m"),
+        "cape_jkg": capes[idx] if idx < len(capes) else None,
+        "uv_index": uvs[idx] if idx < len(uvs) else None,
+        "visibility_km": vis_km,
+        "daily": days_parsed,
+    }
+
+
+def complex_weather_notes(snap: Dict[str, Any]) -> List[str]:
+    notes: List[str] = []
+    code = int(snap.get("weather_code") or 0)
+    cape = float(snap.get("cape_jkg") or 0.0)
+    precip = float(snap.get("precip_mm") or 0.0)
+    prob = float(snap.get("precip_prob_pct") or 0.0)
+    gust = float(snap.get("wind_gust_kmh") or 0.0)
+    wspd = float(snap.get("wind_speed_kmh") or 0.0)
+    vis = snap.get("visibility_km")
+    temp = snap.get("temp_c")
+    uv = snap.get("uv_index")
+
+    if code in {95, 96, 99}:
+        notes.append("⚡ *Dông / đối lưu mạnh:* Có thể kèm sấm sét, mưa rào/mưa đá và gió giật mạnh.")
+    elif cape >= 1500.0:
+        notes.append(f"🌩️ *Đối lưu cao (CAPE {cape:.0f} J/kg):* Dễ phát sinh dông hoặc mưa rào bất chợt.")
+
+    if gust >= 40.0 or wspd >= 28.0:
+        notes.append(f"💨 *Gió mạnh / gió giật:* Gió {wspd:.0f} km/h, giật {gust:.0f} km/h — chú ý an toàn ngoài trời.")
+
+    if precip >= 5.0 or code in {63, 65, 81, 82}:
+        notes.append(f"🌧️ *Mưa vừa đến mưa to ({precip:.1f} mm/h):* Đường trơn trượt, nguy cơ ngập cục bộ và giảm tầm nhìn.")
+    elif prob >= 70.0 and precip == 0.0:
+        notes.append(f"☔ *Khả năng mưa cao ({prob:.0f}%):* Chuẩn bị phương án che chắn khi di chuyển.")
+
+    if code in {45, 48} or (vis is not None and float(vis) < 3.0):
+        vis_txt = f"{float(vis):.1f} km" if vis is not None else "thấp"
+        notes.append(f"🌫️ *Tầm nhìn hạn chế ({vis_txt}):* Có sương mù hoặc mây/mưa thấp che khuất tầm nhìn.")
+
+    if temp is not None and float(temp) >= 36.0:
+        notes.append(f"🔥 *Nắng nóng gay gắt ({float(temp):.1f}°C):* Chú ý say nắng, mất nước khi hoạt động ngoài trời.")
+    if uv is not None and float(uv) >= 8.0:
+        notes.append(f"☀️ *Chỉ số UV rất cao ({float(uv):.1f}):* Cần che chắn, bảo vệ da và mắt khi ra nắng.")
+
+    return notes
+
+
+def sun_status_text(snap: Dict[str, Any], now_dt: dt.datetime) -> str:
+    cloud = snap.get("cloud_cover_pct")
+    uv = snap.get("uv_index")
+    precip = float(snap.get("precip_mm") or 0.0)
+    is_day = 6 <= now_dt.hour <= 17
+
+    if precip > 0:
+        base = "Đang có mưa, không nắng"
+    elif not is_day:
+        base = "Ban đêm / trời tối"
+    elif cloud is not None and float(cloud) <= 25:
+        base = "Nắng rõ / ít mây"
+    elif cloud is not None and float(cloud) <= 60:
+        base = "Nắng xen kẽ mây"
+    else:
+        base = "Nhiều mây, nắng yếu/che khuất"
+
+    if cloud is not None:
+        base += f" (mây {float(cloud):.0f}%)"
+    if uv is not None and is_day:
+        base += f" | UV {float(uv):.1f}"
+    return base
+
+
+def build_forecast_lines(daily_list: List[Dict[str, Any]]) -> List[str]:
+    if not daily_list:
+        return ["• Chưa có dữ liệu dự báo nhiều ngày."]
+
+    lines: List[str] = ["", "📅 *Dự báo những ngày tới:*"]
+    for item in daily_list[1:]:
+        raw_date = item.get("date") or ""
+        try:
+            d_obj = dt.date.fromisoformat(raw_date)
+            day_label = f"{WEEKDAYS_VI[d_obj.weekday()]} ({d_obj.strftime('%d/%m')})"
+        except Exception:
+            day_label = raw_date
+
+        desc = weather_code_desc(item.get("code"))
+        tmin = f"{float(item['tmin']):.0f}°" if item.get("tmin") is not None else "—"
+        tmax = f"{float(item['tmax']):.0f}°" if item.get("tmax") is not None else "—"
+        rain_mm = float(item.get("rain_mm") or 0.0)
+        rain_prob = item.get("rain_prob")
+        gust = item.get("gust_kmh")
+
+        extras: List[str] = []
+        if rain_prob is not None:
+            extras.append(f"mưa {float(rain_prob):.0f}%")
+        if rain_mm > 0:
+            extras.append(f"{rain_mm:.1f}mm")
+        if gust is not None and float(gust) >= 35.0:
+            extras.append(f"giật {float(gust):.0f}km/h")
+
+        extra_txt = f" — {', '.join(extras)}" if extras else ""
+        lines.append(f"• *{day_label}:* {tmin}–{tmax}C, {desc}{extra_txt}")
+
+    return lines
+
+
+def build_report(place: Dict[str, Any], snap: Dict[str, Any], now_dt: dt.datetime, include_forecast: bool = True) -> str:
+    label = format_place_label(place)
+    cond = weather_code_desc(snap.get("weather_code"))
+    notes = complex_weather_notes(snap)
+
+    temp = f"{float(snap['temp_c']):.1f}°C" if snap.get("temp_c") is not None else "—"
+    feels = f"{float(snap['feels_like_c']):.1f}°C" if snap.get("feels_like_c") is not None else "—"
+    hum = f"{float(snap['humidity_pct']):.0f}%" if snap.get("humidity_pct") is not None else "—"
+
+    precip = f"{float(snap['precip_mm']):.1f} mm"
+    prob = f" ({float(snap['precip_prob_pct']):.0f}% khả năng)" if snap.get("precip_prob_pct") is not None else ""
+
+    wspd = f"{float(snap['wind_speed_kmh']):.0f} km/h" if snap.get("wind_speed_kmh") is not None else "—"
+    wgst = f", giật {float(snap['wind_gust_kmh']):.0f} km/h" if snap.get("wind_gust_kmh") is not None else ""
+    wdir = deg_to_dir_vi(snap.get("wind_dir_deg"))
+    vis = f"{float(snap['visibility_km']):.1f} km" if snap.get("visibility_km") is not None else "—"
+    cape = f"{float(snap['cape_jkg']):.0f} J/kg" if snap.get("cape_jkg") is not None else "—"
+
+    lines: List[str] = [
+        f"📍 *{label}*",
+        f"🕒 `{now_dt.strftime('%H:%M %d/%m/%Y')}` (+07) — *{cond}*",
+        "",
+        f"🌡️ *Nhiệt độ:* {temp} (cảm nhận {feels}, ẩm {hum})",
+        f"🌧️ *Mưa:* {precip}{prob}",
+        f"☀️ *Nắng & mây:* {sun_status_text(snap, now_dt)}",
+        f"💨 *Gió:* {wspd}{wgst} — hướng *{wdir}*",
+        f"👁️ *Tầm nhìn:* {vis} | ⚡ *CAPE:* {cape}",
+        "",
+        "⚠️ *Lưu ý điều kiện thời tiết phức tạp:*",
+    ]
+
+    if notes:
+        lines.extend(f"• {n}" for n in notes)
+    else:
+        lines.append("• Hiện chưa ghi nhận hình thái thời tiết phức tạp đáng kể tại khu vực này.")
+
+    if include_forecast:
+        lines.extend(build_forecast_lines(snap.get("daily") or []))
+
+    return "\n".join(lines)
+
+
+def handle_message(chat_id: str, text: str, state: Dict[str, Any], now_dt: dt.datetime) -> None:
+    raw = text.strip()
+    if not raw:
+        return
+
+    cmd = raw.lower()
+    user_data = state.setdefault(chat_id, {"selected_place": None, "active": True})
+    if "active" not in user_data:
+        user_data["active"] = True
+
+    if cmd in {"/end", "/stop", "⏸️ nghỉ ngơi"}:
+        user_data["active"] = False
+        save_json_dict(STATE_FILE, state)
+        tg_send(
+            chat_id,
+            "⏸️ *Bot đã chuyển sang chế độ nghỉ ngơi.*\n"
+            "Mình sẽ tạm ngưng phản hồi các truy vấn thời tiết cho tới khi bạn gửi `/start` hoặc bấm *▶️ Bắt đầu*.",
+        )
+        return
+
+    if cmd in {"/start", "▶️ bắt đầu"}:
+        user_data["active"] = True
+        save_json_dict(STATE_FILE, state)
+        tg_send(
+            chat_id,
+            "▶️ *Bot đã khởi động và sẵn sàng!*\n"
+            "• Nhập *tên bất kỳ địa điểm nào* (vd: `Phù Cát`, `Hà Nội`, `Đà Nẵng`, `dự báo Nam Định`) để xem thời tiết hiện tại + dự báo những ngày tới.\n"
+            "• Gửi `/end` hoặc bấm *⏸️ Nghỉ ngơi* bất cứ lúc nào để bot nghỉ.",
+        )
+        return
+
+    if not user_data.get("active", True):
+        return
+
+    if cmd in {"/help", "❓ hướng dẫn"}:
+        tg_send(
+            chat_id,
+            "🌤️ *Hướng dẫn sử dụng*\n"
+            "• Gửi tên địa điểm bất kỳ (hoặc `dự báo <địa điểm>`) để xem thời tiết hiện tại, lưu ý thời tiết phức tạp và dự báo những ngày tới.\n"
+            "• Bấm *📅 Dự báo nhiều ngày* để xem riêng dự báo các ngày sắp tới.\n"
+            "• Gửi `/end` để bot nghỉ, `/start` để bắt đầu lại.",
+        )
+        return
+
+    if raw == "📅 Dự báo nhiều ngày":
+        place = user_data.get("selected_place") or {
+            "name": "Phù Cát (VVPC)",
+            "admin1": "Bình Định",
+            "country": "Việt Nam",
+            "latitude": 13.9550,
+            "longitude": 109.0422,
+        }
+        snap = fetch_weather_snapshot(place["latitude"], place["longitude"], now_dt, forecast_days=5)
+        header = f"📍 *{format_place_label(place)}*"
+        body = "\n".join(build_forecast_lines(snap.get("daily") or [])).strip()
+        tg_send(chat_id, f"{header}\n{body}")
+        return
+
+    if raw == "⚠️ Lưu ý phức tạp":
+        place = user_data.get("selected_place") or {
+            "name": "Phù Cát (VVPC)",
+            "admin1": "Bình Định",
+            "country": "Việt Nam",
+            "latitude": 13.9550,
+            "longitude": 109.0422,
+        }
+        snap = fetch_weather_snapshot(place["latitude"], place["longitude"], now_dt, forecast_days=2)
+        notes = complex_weather_notes(snap)
+        header = f"⚠️ *Lưu ý thời tiết phức tạp — {format_place_label(place)}*\n"
+        body = "\n".join(f"• {n}" for n in notes) if notes else "• Chưa ghi nhận điều kiện thời tiết phức tạp nổi bật lúc này."
+        tg_send(chat_id, header + body)
+        return
+
+    place = geocode_place(raw)
+    if not place:
+        tg_send(chat_id, f"❌ Không tìm thấy địa điểm: *{raw}*. Thử lại tên rõ hơn (vd: `Đà Nẵng`, `Huế`, `Phù Cát`).")
+        return
+
+    user_data["selected_place"] = place
+    save_json_dict(STATE_FILE, state)
+
+    snap = fetch_weather_snapshot(place["latitude"], place["longitude"], now_dt, forecast_days=5)
+    tg_send(chat_id, build_report(place, snap, now_dt, include_forecast=True))
+
+
+def run_loop() -> None:
+    token = get_token()
+    base_url = f"https://api.telegram.org/bot{token}"
+    offset = load_offset()
+    state = load_json_dict(STATE_FILE)
+    run_once = os.environ.get("RUN_ONCE", "").strip().lower() in {"1", "true", "yes"}
+
+    print(f"[READY] nowcast_telegram.py đang chạy (run_once={run_once}, offset={offset}).")
+    while True:
+        try:
+            params: Dict[str, Any] = {"timeout": 5 if run_once else 25}
+            if offset is not None:
+                params["offset"] = offset
+            resp = requests.get(f"{base_url}/getUpdates", params=params, timeout=15 if run_once else 35)
+            resp.raise_for_status()
+            updates = resp.json().get("result") or []
+
+            now_dt = vn_now()
+            updated_offset = False
+            for upd in updates:
+                uid = upd.get("update_id")
+                if isinstance(uid, int):
+                    offset = uid + 1
+                    updated_offset = True
+                msg = upd.get("message") or upd.get("edited_message") or {}
+                text = msg.get("text")
+                chat = msg.get("chat") or {}
+                chat_id = chat.get("id")
+                if text and chat_id is not None:
+                    try:
+                        handle_message(str(chat_id), str(text), state, now_dt)
+                    except Exception as exc:
+                        print(f"[WARN] Lỗi xử lý tin nhắn từ {chat_id}: {exc}", file=sys.stderr)
+
+            if updated_offset:
+                save_offset(offset)
+
+            if run_once:
+                break
+        except KeyboardInterrupt:
+            print("\n[STOP] Đã dừng nowcast_telegram.py.")
+            break
+        except Exception as exc:
+            print(f"[WARN] Lỗi kết nối Telegram: {exc}", file=sys.stderr)
+            if run_once:
+                break
+            time.sleep(2.0)
+
+
+if __name__ == "__main__":
+    try:
+        run_loop()
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
