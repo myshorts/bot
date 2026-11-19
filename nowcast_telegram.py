@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Interactive Telegram Weather & Complex Weather Advisory Bot
-- Bàn phím nút bấm nhanh dưới khung chat (ReplyKeyboardMarkup)
-- Hỏi địa điểm bất kỳ -> trả về thời tiết + cảnh báo các điều kiện thời tiết phức tạp
-- Lưu khu vực đã chọn & ưu tiên lưu ý thời tiết phức tạp
-- Chạy polling trực tiếp (phản hồi ngay, không cần cron 10 phút)
+On-Demand Interactive Telegram Weather & Complex Weather Bot
+- Chỉ phản hồi khi bạn nhắn tin / chọn địa điểm trên Telegram
+- Hỏi bất kỳ địa điểm nào -> trả về mưa, nắng/mây/UV, nhiệt độ, gió + lưu ý thời tiết phức tạp
+- Có bàn phím nút chọn nhanh dưới khung chat
 """
 
 import datetime as dt
@@ -20,7 +19,7 @@ import requests
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 STATE_FILE = Path(os.environ.get("STATE_FILE", "bot_user_state.json"))
-USER_AGENT = "Interactive-Complex-Weather-Bot/2.0"
+USER_AGENT = "OnDemand-Weather-Bot/1.0"
 
 MAIN_KEYBOARD = {
     "keyboard": [
@@ -84,6 +83,7 @@ def geocode_place(query: str) -> Optional[Dict[str, Any]]:
     for prefix in ("📍 ", "🏙️ ", "🌊 ", "🌴 ", "⛰️ "):
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix):].strip()
+
     if cleaned.lower().startswith("phù cát"):
         return {
             "name": "Phù Cát (VVPC)",
@@ -204,7 +204,6 @@ def fetch_weather_snapshot(lat: float, lon: float, now_dt: dt.datetime) -> Dict[
 
 
 def complex_weather_notes(snap: Dict[str, Any]) -> List[str]:
-    """Liệt kê các điều kiện thời tiết phức tạp cần lưu ý tại khu vực được chọn."""
     notes: List[str] = []
     code = int(snap.get("weather_code") or 0)
     cape = float(snap.get("cape_jkg") or 0.0)
@@ -217,12 +216,12 @@ def complex_weather_notes(snap: Dict[str, Any]) -> List[str]:
     uv = snap.get("uv_index")
 
     if code in {95, 96, 99}:
-        notes.append("⚡ *Dông / mây đối lưu mạnh (Cb):* Có khả năng kèm sấm sét, mưa rào/mưa đá và gió giật mạnh.")
+        notes.append("⚡ *Dông / đối lưu mạnh:* Có khả năng kèm sấm sét, mưa rào/mưa đá và gió giật mạnh.")
     elif cape >= 1500.0:
-        notes.append(f"🌩️ *Năng lượng đối lưu cao (CAPE {cape:.0f} J/kg):* Khí quyển bất ổn định, dễ phát sinh dông/mưa rào đột ngột.")
+        notes.append(f"🌩️ *Đối lưu cao (CAPE {cape:.0f} J/kg):* Dễ phát sinh dông hoặc mưa rào bất chợt.")
 
     if gust >= 40.0 or wspd >= 28.0:
-        notes.append(f"💨 *Gió mạnh / gió giật:* Gió {wspd:.0f} km/h, giật {gust:.0f} km/h — chú ý an toàn ngoài trời và khu vực trống trải.")
+        notes.append(f"💨 *Gió mạnh / gió giật:* Gió {wspd:.0f} km/h, giật {gust:.0f} km/h — chú ý an toàn ngoài trời.")
 
     if precip >= 5.0 or code in {63, 65, 81, 82}:
         notes.append(f"🌧️ *Mưa vừa đến mưa to ({precip:.1f} mm/h):* Đường trơn trượt, nguy cơ ngập cục bộ và giảm tầm nhìn.")
@@ -231,12 +230,12 @@ def complex_weather_notes(snap: Dict[str, Any]) -> List[str]:
 
     if code in {45, 48} or (vis is not None and float(vis) < 3.0):
         vis_txt = f"{float(vis):.1f} km" if vis is not None else "thấp"
-        notes.append(f"🌫️ *Tầm nhìn hạn chế ({vis_txt}):* Có sương mù hoặc mưa/mây thấp che khuất tầm nhìn.")
+        notes.append(f"🌫️ *Tầm nhìn hạn chế ({vis_txt}):* Có sương mù hoặc mây/mưa thấp che khuất tầm nhìn.")
 
     if temp is not None and float(temp) >= 36.0:
-        notes.append(f"🔥 *Nắng nóng gay gắt ({float(temp):.1f}°C):* Dễ say nắng/mất nước khi hoạt động lâu ngoài trời.")
+        notes.append(f"🔥 *Nắng nóng gay gắt ({float(temp):.1f}°C):* Chú ý say nắng, mất nước khi hoạt động ngoài trời.")
     if uv is not None and float(uv) >= 8.0:
-        notes.append(f"☀️ *Chỉ số UV rất cao ({float(uv):.1f}):* Cần bảo vệ da và mắt khi ra nắng.")
+        notes.append(f"☀️ *Chỉ số UV rất cao ({float(uv):.1f}):* Cần che chắn, bảo vệ da và mắt khi ra nắng.")
 
     return notes
 
@@ -309,15 +308,15 @@ def handle_message(chat_id: str, text: str, state: Dict[str, Any], now_dt: dt.da
     if not raw:
         return
 
-    user_data = state.setdefault(chat_id, {"selected_place": None, "history": []})
+    user_data = state.setdefault(chat_id, {"selected_place": None})
 
     if raw in {"/start", "/help", "❓ Hướng dẫn"}:
         tg_send(
             chat_id,
-            "🌤️ *Bot Thời Tiết & Lưu Ý Thời Tiết Phức Tạp*\n"
-            "• Nhập *bất kỳ địa điểm nào* (vd: `Quy Nhơn`, `Sapa`, `Nha Trang`, `Phù Cát`) hoặc bấm nút bên dưới để xem ngay.\n"
-            "• Mỗi lần chọn/hỏi địa điểm, bot sẽ lưu khu vực hiện tại và liệt kê *điều kiện thời tiết phức tạp* (dông, gió giật, mưa lớn, tầm nhìn kém, CAPE cao, nắng nóng/UV).\n"
-            "• Bấm *⭐ Khu vực đã chọn* để xem lại nhanh khu vực gần nhất.",
+            "🌤️ *Bot Thời Tiết Theo Yêu Cầu*\n"
+            "• Nhập *tên bất kỳ địa điểm nào* (vd: `Quy Nhơn`, `Phù Cát`, `Sapa`, `Tokyo`) hoặc bấm nút bên dưới để xem ngay.\n"
+            "• Bot chỉ trả lời khi bạn hỏi/chọn địa điểm, đồng thời liệt kê *lưu ý điều kiện thời tiết phức tạp* (dông, gió giật, mưa lớn, tầm nhìn kém, CAPE cao, nắng nóng/UV).\n"
+            "• Bấm *⭐ Khu vực đã chọn* để xem lại nhanh khu vực bạn vừa chọn.",
         )
         return
 
@@ -333,45 +332,40 @@ def handle_message(chat_id: str, text: str, state: Dict[str, Any], now_dt: dt.da
     if raw == "⚠️ Lưu ý thời tiết phức tạp":
         place = user_data.get("selected_place")
         if not place:
-            tg_send(chat_id, "Hãy chọn/nhập một địa điểm trước để kiểm tra lưu ý thời tiết phức tạp.")
+            tg_send(chat_id, "Hãy chọn hoặc nhập tên một địa điểm trước để xem lưu ý thời tiết phức tạp.")
             return
         snap = fetch_weather_snapshot(place["latitude"], place["longitude"], now_dt)
         notes = complex_weather_notes(snap)
         header = f"⚠️ *Lưu ý thời tiết phức tạp — {format_place_label(place)}*\n"
-        body = "\n".join(f"• {n}" for n in notes) if notes else "• Chưa có cảnh báo phức tạp nổi bật lúc này."
+        body = "\n".join(f"• {n}" for n in notes) if notes else "• Chưa ghi nhận điều kiện thời tiết phức tạp nổi bật lúc này."
         tg_send(chat_id, header + body)
         return
 
     place = geocode_place(raw)
     if not place:
-        tg_send(chat_id, f"❌ Không tìm thấy địa điểm: *{raw}*. Thử gõ tên rõ hơn (vd: `Đà Nẵng`, `Huế`, `Phù Cát`).")
+        tg_send(chat_id, f"❌ Không tìm thấy địa điểm: *{raw}*. Hãy thử tên rõ hơn (vd: `Đà Nẵng`, `Huế`, `Phù Cát`).")
         return
 
     user_data["selected_place"] = place
-    hist: List[str] = user_data.setdefault("history", [])
-    label = format_place_label(place)
-    if label not in hist:
-        hist.insert(0, label)
-        user_data["history"] = hist[:10]
     save_state(state)
 
     snap = fetch_weather_snapshot(place["latitude"], place["longitude"], now_dt)
     tg_send(chat_id, build_report(place, snap, now_dt))
 
 
-def run_loop(poll_interval: float = 2.0) -> None:
+def run_on_demand_loop() -> None:
     token = get_token()
     base_url = f"https://api.telegram.org/bot{token}"
     offset: Optional[int] = None
     state = load_state()
 
-    print("[START] Bot đang chạy trực tiếp (polling). Nhấn Ctrl+C để dừng.")
+    print("[READY] Bot đang chờ bạn nhắn tin/chọn địa điểm trên Telegram (Ctrl+C để dừng).")
     while True:
         try:
-            params: Dict[str, Any] = {"timeout": 20}
+            params: Dict[str, Any] = {"timeout": 25}
             if offset is not None:
                 params["offset"] = offset
-            resp = requests.get(f"{base_url}/getUpdates", params=params, timeout=30)
+            resp = requests.get(f"{base_url}/getUpdates", params=params, timeout=35)
             resp.raise_for_status()
             updates = resp.json().get("result") or []
 
@@ -393,23 +387,23 @@ def run_loop(poll_interval: float = 2.0) -> None:
             print("\n[STOP] Đã dừng bot.")
             break
         except Exception as exc:
-            print(f"[WARN] Lỗi polling: {exc}", file=sys.stderr)
-            time.sleep(poll_interval)
+            print(f"[WARN] Lỗi kết nối Telegram: {exc}", file=sys.stderr)
+            time.sleep(2.0)
 
 
 def main() -> None:
     if len(sys.argv) >= 3 and sys.argv[1] == "--ask":
-        place_query = " ".join(sys.argv[2:])
-        place = geocode_place(place_query)
+        query = " ".join(sys.argv[2:])
+        place = geocode_place(query)
         if not place:
-            print(f"Không tìm thấy địa điểm: {place_query}")
+            print(f"Không tìm thấy địa điểm: {query}")
             sys.exit(1)
         now_dt = vn_now()
         snap = fetch_weather_snapshot(place["latitude"], place["longitude"], now_dt)
         print(build_report(place, snap, now_dt))
         return
 
-    run_loop()
+    run_on_demand_loop()
 
 
 if __name__ == "__main__":
