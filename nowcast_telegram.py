@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Telegram Weather Bot:
-- Điều khiển bật/tắt bằng /start và /end (hoặc /stop)
-- Hỏi thời tiết bất kỳ địa điểm nào (hỗ trợ cả "dự báo <địa điểm>") + dự báo những ngày tới
-- Cảnh báo / lưu ý điều kiện thời tiết phức tạp
+nowcast_telegram.py
+Bot Telegram thời tiết & cảnh báo điều kiện thời tiết phức tạp chạy trên GitHub Actions (workflow_dispatch):
+- Điều khiển bật/tắt bằng /start (▶️ Bắt đầu) và /end hoặc /stop (⏸️ Nghỉ ngơi)
+- Hỏi bất kỳ địa điểm nào (hỗ trợ "dự báo <địa điểm>", "thời tiết <địa điểm>", hoặc tên địa điểm trực tiếp)
+- Phân tích lưu ý điều kiện thời tiết phức tạp + dự báo những ngày tới
+- Hỗ trợ RUN_ONCE=1 khi bấm Run workflow trên GitHub
 """
 
 import datetime as dt
@@ -19,8 +21,10 @@ import requests
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
 STATE_FILE = Path(os.environ.get("STATE_FILE", "bot_user_state.json"))
-USER_AGENT = "Telegram-Weather-Bot/2.1"
+OFFSET_FILE = Path(os.environ.get("OFFSET_FILE", ".tg_offset.json"))
+USER_AGENT = "Nowcast-Telegram-Bot/3.1"
 
 MAIN_KEYBOARD = {
     "keyboard": [
@@ -38,21 +42,32 @@ def vn_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone(dt.timedelta(hours=7)))
 
 
-def load_state() -> Dict[str, Any]:
-    if not STATE_FILE.exists():
+def load_json_dict(path: Path) -> Dict[str, Any]:
+    if not path.exists():
         return {}
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def save_state(state: Dict[str, Any]) -> None:
+def save_json_dict(path: Path, data: Dict[str, Any]) -> None:
     try:
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
-        print(f"[WARN] Không lưu được state: {exc}", file=sys.stderr)
+        print(f"[WARN] Không lưu được {path}: {exc}", file=sys.stderr)
+
+
+def load_offset() -> Optional[int]:
+    data = load_json_dict(OFFSET_FILE)
+    val = data.get("offset")
+    return int(val) if isinstance(val, int) else None
+
+
+def save_offset(offset: Optional[int]) -> None:
+    if offset is not None:
+        save_json_dict(OFFSET_FILE, {"offset": offset, "updated_at": vn_now().isoformat()})
 
 
 def get_token() -> str:
@@ -100,7 +115,7 @@ def geocode_place(query: str) -> Optional[Dict[str, Any]]:
     if not cleaned:
         return None
 
-    if cleaned.lower().startswith("phù cát"):
+    if cleaned.lower().startswith("phù cát") or cleaned.lower() == "vvpc":
         return {
             "name": "Phù Cát (VVPC)",
             "admin1": "Bình Định",
@@ -394,7 +409,7 @@ def handle_message(chat_id: str, text: str, state: Dict[str, Any], now_dt: dt.da
 
     if cmd in {"/end", "/stop", "⏸️ nghỉ ngơi"}:
         user_data["active"] = False
-        save_state(state)
+        save_json_dict(STATE_FILE, state)
         tg_send(
             chat_id,
             "⏸️ *Bot đã chuyển sang chế độ nghỉ ngơi.*\n"
@@ -404,7 +419,7 @@ def handle_message(chat_id: str, text: str, state: Dict[str, Any], now_dt: dt.da
 
     if cmd in {"/start", "▶️ bắt đầu"}:
         user_data["active"] = True
-        save_state(state)
+        save_json_dict(STATE_FILE, state)
         tg_send(
             chat_id,
             "▶️ *Bot đã khởi động và sẵn sàng!*\n"
@@ -420,7 +435,7 @@ def handle_message(chat_id: str, text: str, state: Dict[str, Any], now_dt: dt.da
         tg_send(
             chat_id,
             "🌤️ *Hướng dẫn sử dụng*\n"
-            "• Gửi tên địa điểm bất kỳ để xem thời tiết hiện tại, lưu ý thời tiết phức tạp và dự báo những ngày tới.\n"
+            "• Gửi tên địa điểm bất kỳ (hoặc `dự báo <địa điểm>`) để xem thời tiết hiện tại, lưu ý thời tiết phức tạp và dự báo những ngày tới.\n"
             "• Bấm *📅 Dự báo nhiều ngày* để xem riêng dự báo các ngày sắp tới.\n"
             "• Gửi `/end` để bot nghỉ, `/start` để bắt đầu lại.",
         )
@@ -461,33 +476,36 @@ def handle_message(chat_id: str, text: str, state: Dict[str, Any], now_dt: dt.da
         return
 
     user_data["selected_place"] = place
-    save_state(state)
+    save_json_dict(STATE_FILE, state)
 
     snap = fetch_weather_snapshot(place["latitude"], place["longitude"], now_dt, forecast_days=5)
     tg_send(chat_id, build_report(place, snap, now_dt, include_forecast=True))
 
 
-def run_polling_loop() -> None:
+def run_loop() -> None:
     token = get_token()
     base_url = f"https://api.telegram.org/bot{token}"
-    offset: Optional[int] = None
-    state = load_state()
+    offset = load_offset()
+    state = load_json_dict(STATE_FILE)
+    run_once = os.environ.get("RUN_ONCE", "").strip().lower() in {"1", "true", "yes"}
 
-    print("[READY] Bot đang chờ lệnh trên Telegram (gửi /start để bắt đầu, /end để nghỉ, Ctrl+C để thoát).")
+    print(f"[READY] nowcast_telegram.py đang chạy (run_once={run_once}, offset={offset}).")
     while True:
         try:
-            params: Dict[str, Any] = {"timeout": 25}
+            params: Dict[str, Any] = {"timeout": 5 if run_once else 25}
             if offset is not None:
                 params["offset"] = offset
-            resp = requests.get(f"{base_url}/getUpdates", params=params, timeout=35)
+            resp = requests.get(f"{base_url}/getUpdates", params=params, timeout=15 if run_once else 35)
             resp.raise_for_status()
             updates = resp.json().get("result") or []
 
             now_dt = vn_now()
+            updated_offset = False
             for upd in updates:
                 uid = upd.get("update_id")
                 if isinstance(uid, int):
                     offset = uid + 1
+                    updated_offset = True
                 msg = upd.get("message") or upd.get("edited_message") or {}
                 text = msg.get("text")
                 chat = msg.get("chat") or {}
@@ -497,17 +515,29 @@ def run_polling_loop() -> None:
                         handle_message(str(chat_id), str(text), state, now_dt)
                     except Exception as exc:
                         print(f"[WARN] Lỗi xử lý tin nhắn từ {chat_id}: {exc}", file=sys.stderr)
+                        try:
+                            tg_send(str(chat_id), f"⚠️ Có lỗi khi xử lý `{text}`: {exc}")
+                        except Exception:
+                            pass
+
+            if updated_offset:
+                save_offset(offset)
+
+            if run_once:
+                break
         except KeyboardInterrupt:
-            print("\n[STOP] Đã dừng bot.")
+            print("\n[STOP] Đã dừng nowcast_telegram.py.")
             break
         except Exception as exc:
             print(f"[WARN] Lỗi kết nối Telegram: {exc}", file=sys.stderr)
+            if run_once:
+                break
             time.sleep(2.0)
 
 
 if __name__ == "__main__":
     try:
-        run_polling_loop()
+        run_loop()
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         sys.exit(1)
