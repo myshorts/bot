@@ -2,13 +2,14 @@
 """
 Telegram Weather Bot:
 - Điều khiển bật/tắt bằng /start và /end (hoặc /stop)
-- Hỏi thời tiết bất kỳ địa điểm nào + dự báo những ngày tới
+- Hỏi thời tiết bất kỳ địa điểm nào (hỗ trợ cả "dự báo <địa điểm>") + dự báo những ngày tới
 - Cảnh báo / lưu ý điều kiện thời tiết phức tạp
 """
 
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -19,7 +20,7 @@ import requests
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 STATE_FILE = Path(os.environ.get("STATE_FILE", "bot_user_state.json"))
-USER_AGENT = "Telegram-Weather-Bot/2.0"
+USER_AGENT = "Telegram-Weather-Bot/2.1"
 
 MAIN_KEYBOARD = {
     "keyboard": [
@@ -80,11 +81,24 @@ def tg_send(chat_id: str, text: str, with_keyboard: bool = True) -> None:
     resp.raise_for_status()
 
 
-def geocode_place(query: str) -> Optional[Dict[str, Any]]:
+def normalize_place_query(query: str) -> str:
     cleaned = query.strip()
     for prefix in ("📍 ", "🏙️ ", "🌊 ", "🌴 ", "⛰️ "):
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix) :].strip()
+    cleaned = re.sub(
+        r"^(dự báo thời tiết|dự báo|thời tiết|xem thời tiết|hỏi thời tiết)\s+(tại|ở|cho|khu vực)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    return cleaned
+
+
+def geocode_place(query: str) -> Optional[Dict[str, Any]]:
+    cleaned = normalize_place_query(query)
+    if not cleaned:
+        return None
 
     if cleaned.lower().startswith("phù cát"):
         return {
@@ -394,7 +408,7 @@ def handle_message(chat_id: str, text: str, state: Dict[str, Any], now_dt: dt.da
         tg_send(
             chat_id,
             "▶️ *Bot đã khởi động và sẵn sàng!*\n"
-            "• Nhập *tên bất kỳ địa điểm nào* (vd: `Phù Cát`, `Hà Nội`, `Đà Nẵng`) để xem thời tiết hiện tại + dự báo những ngày tới.\n"
+            "• Nhập *tên bất kỳ địa điểm nào* (vd: `Phù Cát`, `Hà Nội`, `Đà Nẵng`, `dự báo Nam Định`) để xem thời tiết hiện tại + dự báo những ngày tới.\n"
             "• Gửi `/end` hoặc bấm *⏸️ Nghỉ ngơi* bất cứ lúc nào để bot nghỉ.",
         )
         return
